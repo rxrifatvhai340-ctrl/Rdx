@@ -1,13 +1,15 @@
 """
-SMS CDR Automation Bot - Single Script
-সব কিছু এক ফাইলে
+SMS CDR Automation Bot - Single Script with Session Management
+সব কিছু এক ফাইলে + 24/7 Session Keep Alive
 """
 
 import asyncio
 import aiohttp
 import re
 import logging
+import time
 from typing import Optional, Dict
+from datetime import datetime
 
 # ============ CONFIGURATION ============
 BASE_URL = "http://65.109.111.158"
@@ -24,6 +26,8 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 30
 LOG_FILE = "bot.log"
+SESSION_CHECK_INTERVAL = 120  # 2 minutes
+MAX_RETRIES = 3
 
 # ============ LOGGING SETUP ============
 logging.basicConfig(
@@ -46,6 +50,9 @@ class SMSCDRBot:
         self.session: Optional[aiohttp.ClientSession] = None
         self.cookies = {}
         self.sesskey = None
+        self.php_sessionid = None
+        self.last_login_time = None
+        self.session_active = False
 
     async def __aenter__(self):
         """Context manager entry"""
@@ -141,27 +148,72 @@ class SMSCDRBot:
             logger.error(f"❌ Error extracting CAPTCHA: {e}")
             return None
 
-    async def login(self) -> bool:
+    def extract_session_key(self, html: str) -> Optional[str]:
+        """
+        HTML থেকে session key extract করবে
+        """
+        try:
+            # Multiple patterns to find sesskey
+            patterns = [
+                r'sesskey=([A-Z0-9]+)',
+                r'"sesskey":"([A-Z0-9]+)"',
+                r"'sesskey':'([A-Z0-9]+)'",
+                r'sesskey["\']?\s*:\s*["\']([A-Z0-9]+)["\']',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, html)
+                if match:
+                    sesskey = match.group(1)
+                    logger.info(f"✅ Session key found: {sesskey}")
+                    return sesskey
+            
+            # If not found in HTML, use PHPSESSID as fallback
+            if 'PHPSESSID' in self.cookies:
+                self.php_sessionid = self.cookies['PHPSESSID'].value
+                logger.warning(f"⚠️ Session key not in HTML, using PHPSESSID: {self.php_sessionid}")
+                return self.php_sessionid
+            
+            logger.error("❌ Session key not found")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error extracting session key: {e}")
+            return None
+
+    async def login(self, retry_count=0) -> bool:
         """
         Login করবে with CAPTCHA solving
         """
+        if retry_count >= MAX_RETRIES:
+            logger.error(f"❌ Max retries ({MAX_RETRIES}) exceeded. Login failed.")
+            return False
+        
         try:
+            logger.info(f"🔐 Login attempt #{retry_count + 1}/{MAX_RETRIES}")
+            logger.info("=" * 60)
+            
             # Step 1: Login page fetch করবে CAPTCHA পেতে
             logger.info("🔐 Step 1: Fetching login page...")
             html = await self.get_login_page()
             if not html:
-                return False
+                logger.error("❌ Failed to fetch login page. Retrying...")
+                await asyncio.sleep(2)
+                return await self.login(retry_count + 1)
             
             # Step 2: CAPTCHA extract এবং solve করবে
             logger.info("🔐 Step 2: Extracting CAPTCHA...")
             captcha_text = self.extract_captcha_text(html)
             if not captcha_text:
-                return False
+                logger.error("❌ Failed to extract CAPTCHA. Retrying...")
+                await asyncio.sleep(2)
+                return await self.login(retry_count + 1)
             
             logger.info("🔐 Step 3: Solving CAPTCHA...")
             captcha_answer = self.solve_captcha(captcha_text)
             if captcha_answer is None:
-                return False
+                logger.error("❌ Failed to solve CAPTCHA. Retrying...")
+                await asyncio.sleep(2)
+                return await self.login(retry_count + 1)
             
             # Step 4: Login করবে
             logger.info("🔐 Step 4: Logging in...")
@@ -194,75 +246,163 @@ class SMSCDRBot:
                     if 'logout' in html.lower() or 'dashboard' in html.lower() or 'SMSCDRStats' in html:
                         logger.info("✅ Login successful!")
                         
-                        # Extract sesskey from HTML or URL
-                        sesskey_pattern = r'sesskey=([A-Z0-9]+)'
-                        match = re.search(sesskey_pattern, html)
-                        if match:
-                            self.sesskey = match.group(1)
-                            logger.info(f"✅ Session key extracted: {self.sesskey}")
-                        else:
-                            logger.warning("⚠️ Session key not found in HTML")
+                        # Extract session key
+                        self.sesskey = self.extract_session_key(html)
+                        
+                        # Store PHPSESSID
+                        if 'PHPSESSID' in self.cookies:
+                            self.php_sessionid = self.cookies['PHPSESSID'].value
+                            logger.info(f"✅ PHPSESSID: {self.php_sessionid}")
+                        
+                        self.last_login_time = datetime.now()
+                        self.session_active = True
+                        
+                        logger.info("=" * 60)
+                        logger.info(f"✅ Session established at {self.last_login_time}")
+                        logger.info("=" * 60)
                         
                         return True
                     else:
                         logger.error("❌ Login failed - unknown error")
                         logger.debug(f"Response content (first 500 chars): {html[:500]}")
-                        return False
+                        await asyncio.sleep(2)
+                        return await self.login(retry_count + 1)
                 else:
                     logger.error(f"❌ Login request failed: {resp.status}")
-                    return False
+                    await asyncio.sleep(2)
+                    return await self.login(retry_count + 1)
         except Exception as e:
             logger.error(f"❌ Error during login: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            await asyncio.sleep(2)
+            return await self.login(retry_count + 1)
+
+    async def check_session(self) -> bool:
+        """
+        Session check করবে - valid কিনা দেখবে
+        """
+        try:
+            logger.info("🔍 Checking session validity...")
+            
+            # Try to access a protected page
+            url = f"{self.base_url}/ints/agent/SMSCDRStats"
+            headers = {
+                **HEADERS,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            }
+            
+            async with self.session.get(url, headers=headers, cookies=self.cookies, 
+                                       timeout=REQUEST_TIMEOUT, ssl=False) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    if 'logout' in html.lower() or 'SMSCDRStats' in html or 'dashboard' in html.lower():
+                        logger.info(f"✅ Session is valid. Last login: {self.last_login_time}")
+                        return True
+                    else:
+                        logger.warning("⚠️ Session appears to be invalid")
+                        return False
+                else:
+                    logger.warning(f"⚠️ Session check returned status: {resp.status}")
+                    return False
+        except Exception as e:
+            logger.error(f"❌ Error checking session: {e}")
             return False
 
-    def get_session_key(self) -> Optional[str]:
-        """Session key return করবে"""
-        return self.sesskey
+    async def keep_session_alive(self):
+        """
+        Session 24/7 keep alive রাখবে
+        প্রতি 2 মিনিটে check করবে এবং প্রয়োজনে relogin করবে
+        """
+        logger.info("🔄 Starting session keep-alive monitor...")
+        logger.info(f"📊 Check interval: {SESSION_CHECK_INTERVAL} seconds")
+        
+        while True:
+            try:
+                await asyncio.sleep(SESSION_CHECK_INTERVAL)
+                
+                logger.info("-" * 60)
+                logger.info(f"⏰ Session check at {datetime.now()}")
+                
+                # Check if session is still valid
+                if not self.session_active or not await self.check_session():
+                    logger.warning("⚠️ Session lost! Auto-relogging in...")
+                    success = await self.login()
+                    if success:
+                        logger.info("✅ Session refreshed successfully")
+                    else:
+                        logger.error("❌ Failed to refresh session")
+                else:
+                    logger.info(f"✅ Session OK - Uptime: {datetime.now() - self.last_login_time}")
+                
+                logger.info("-" * 60)
+                
+            except asyncio.CancelledError:
+                logger.info("🛑 Session monitor stopped")
+                break
+            except Exception as e:
+                logger.error(f"❌ Error in keep_session_alive: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(5)  # Wait before retry
 
-    def get_cookies(self) -> Dict:
-        """Cookies return করবে"""
-        return self.cookies
+    def get_session_info(self) -> Dict:
+        """Session information return করবে"""
+        return {
+            'active': self.session_active,
+            'sesskey': self.sesskey,
+            'phpsessid': self.php_sessionid,
+            'last_login': self.last_login_time,
+            'cookies': self.cookies,
+            'uptime': str(datetime.now() - self.last_login_time) if self.last_login_time else None
+        }
 
 
-# ============ TEST FUNCTION ============
-async def test_login():
-    """Login test করবে"""
-    logger.info("=" * 50)
-    logger.info("🚀 Starting Login Test...")
-    logger.info("=" * 50)
+# ============ MAIN TEST FUNCTION ============
+async def main():
+    """Main function"""
+    logger.info("\n" + "=" * 60)
+    logger.info("🚀 SMS CDR Bot - Starting with Session Management")
+    logger.info("=" * 60 + "\n")
     
     try:
         async with SMSCDRBot() as bot:
+            # Initial login
             success = await bot.login()
             
-            logger.info("=" * 50)
-            if success:
-                logger.info("✅ LOGIN SUCCESSFUL!")
-                logger.info(f"Session Key: {bot.get_session_key()}")
-                logger.info(f"Cookies: {bot.get_cookies()}")
-            else:
-                logger.info("❌ LOGIN FAILED!")
-            logger.info("=" * 50)
+            if not success:
+                logger.error("❌ Initial login failed!")
+                return
             
-            return success
+            logger.info("✅ Initial login successful!")
+            logger.info(f"📊 Session Info: {bot.get_session_info()}\n")
+            
+            # Start session keep-alive monitor
+            keep_alive_task = asyncio.create_task(bot.keep_session_alive())
+            
+            try:
+                # Keep running
+                await asyncio.sleep(float('inf'))
+            except KeyboardInterrupt:
+                logger.info("\n⏹️ Stopping bot...")
+                keep_alive_task.cancel()
+                try:
+                    await keep_alive_task
+                except asyncio.CancelledError:
+                    pass
     except Exception as e:
-        logger.error(f"❌ Test failed with exception: {e}")
+        logger.error(f"❌ Fatal error: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return False
 
 
-# ============ MAIN ============
+# ============ ENTRY POINT ============
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("SMS CDR Bot - Login Test")
-    print("="*50 + "\n")
-    
-    result = asyncio.run(test_login())
-    
-    if result:
-        print("\n✅ Bot is ready for use!")
-    else:
-        print("\n❌ Bot failed to login. Check logs for details.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("\n🛑 Bot stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Unexpected error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
