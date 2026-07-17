@@ -1,6 +1,6 @@
 """
 SMS CDR Automation Bot - Single Script with Session Management
-সব কিছু এক ফাইলে + 24/7 Session Keep Alive
+সব কিছু এক ফাইলে + 24/7 Session Keep Alive + Data Monitoring
 """
 
 import asyncio
@@ -8,7 +8,8 @@ import aiohttp
 import re
 import logging
 import time
-from typing import Optional, Dict
+import json
+from typing import Optional, Dict, List
 from datetime import datetime
 
 # ============ CONFIGURATION ============
@@ -27,6 +28,7 @@ HEADERS = {
 REQUEST_TIMEOUT = 30
 LOG_FILE = "bot.log"
 SESSION_CHECK_INTERVAL = 120  # 2 minutes
+DATA_CHECK_INTERVAL = 15.5  # 15.5 seconds
 MAX_RETRIES = 3
 
 # ============ LOGGING SETUP ============
@@ -53,6 +55,9 @@ class SMSCDRBot:
         self.php_sessionid = None
         self.last_login_time = None
         self.session_active = False
+        self.last_data_check = None
+        self.previous_data = None
+        self.data_check_count = 0
 
     async def __aenter__(self):
         """Context manager entry"""
@@ -309,13 +314,114 @@ class SMSCDRBot:
             logger.error(f"❌ Error checking session: {e}")
             return False
 
+    async def fetch_sms_cdr_data(self) -> Optional[List[Dict]]:
+        """
+        SMS CDR data fetch করবে
+        """
+        try:
+            self.data_check_count += 1
+            logger.info(f"\n📊 Data Check #{self.data_check_count} at {datetime.now()}")
+            
+            url = f"{self.base_url}/ints/agent/res/data_smscdr.php"
+            
+            # Build parameters
+            params = {
+                'fdate1': '2026-07-17 00:00:00',
+                'fdate2': '2026-07-17 23:59:59',
+                'frange': '',
+                'fclient': '',
+                'fnum': '',
+                'fcli': '',
+                'fgdate': '',
+                'fgmonth': '',
+                'fgrange': '',
+                'fgclient': '',
+                'fgnumber': '',
+                'fgcli': '',
+                'fg': '0',
+                'sesskey': self.sesskey or self.php_sessionid,
+                'sEcho': '2',
+                'iColumns': '9',
+                'sColumns': ',,,,,,,,',
+                'iDisplayStart': '0',
+                'iDisplayLength': '-1',
+                'bSortable_0': 'true',
+                'bSortable_1': 'true',
+                'bSortable_2': 'true',
+                'bSortable_3': 'true',
+                'bSortable_4': 'true',
+                'bSortable_5': 'true',
+                'bSortable_6': 'true',
+                'bSortable_7': 'true',
+                'bSortable_8': 'false',
+                'iSortCol_0': '0',
+                'sSortDir_0': 'desc',
+                'iSortingCols': '1',
+            }
+            
+            headers = {
+                **HEADERS,
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': f'{self.base_url}/ints/agent/SMSCDRStats',
+            }
+            
+            async with self.session.get(url, params=params, headers=headers, 
+                                       cookies=self.cookies, timeout=REQUEST_TIMEOUT, ssl=False) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    if 'aaData' in data:
+                        records = data['aaData']
+                        logger.info(f"✅ Data fetched successfully - Total records: {len(records)}")
+                        
+                        # Print to terminal
+                        print("\n" + "="*100)
+                        print(f"📊 SMS CDR DATA - Check #{self.data_check_count} | Time: {datetime.now()}")
+                        print("="*100)
+                        
+                        if len(records) > 0:
+                            print(f"{'Total Records':<15} | {len(records)}")
+                            print("-"*100)
+                            
+                            # Show first 5 records
+                            for idx, record in enumerate(records[:5], 1):
+                                print(f"Record #{idx}: {record}")
+                            
+                            if len(records) > 5:
+                                print(f"... and {len(records) - 5} more records")
+                        else:
+                            print("ℹ️ No records found")
+                        
+                        print("="*100 + "\n")
+                        
+                        # Check if data changed
+                        if self.previous_data and self.previous_data != records:
+                            logger.info(f"🔔 NEW DATA DETECTED! ({len(records)} records)")
+                        
+                        self.previous_data = records
+                        self.last_data_check = datetime.now()
+                        
+                        return records
+                    else:
+                        logger.warning("⚠️ No 'aaData' in response")
+                        return None
+                else:
+                    logger.error(f"❌ Data fetch failed: {resp.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"❌ Error fetching SMS CDR data: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
     async def keep_session_alive(self):
         """
         Session 24/7 keep alive রাখবে
         প্রতি 2 মিনিটে check করবে এবং প্রয়োজনে relogin করবে
         """
         logger.info("🔄 Starting session keep-alive monitor...")
-        logger.info(f"📊 Check interval: {SESSION_CHECK_INTERVAL} seconds")
+        logger.info(f"📊 Session check interval: {SESSION_CHECK_INTERVAL} seconds")
         
         while True:
             try:
@@ -346,6 +452,31 @@ class SMSCDRBot:
                 logger.error(traceback.format_exc())
                 await asyncio.sleep(5)  # Wait before retry
 
+    async def monitor_data(self):
+        """
+        প্রতি 15.5 সেকেন্ডে নতুন data check করবে
+        """
+        logger.info("📡 Starting data monitoring...")
+        logger.info(f"📊 Data check interval: {DATA_CHECK_INTERVAL} seconds\n")
+        
+        while True:
+            try:
+                await asyncio.sleep(DATA_CHECK_INTERVAL)
+                
+                if self.session_active:
+                    await self.fetch_sms_cdr_data()
+                else:
+                    logger.warning("⚠️ Session not active, skipping data check")
+                
+            except asyncio.CancelledError:
+                logger.info("🛑 Data monitor stopped")
+                break
+            except Exception as e:
+                logger.error(f"❌ Error in monitor_data: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(5)
+
     def get_session_info(self) -> Dict:
         """Session information return করবে"""
         return {
@@ -354,7 +485,9 @@ class SMSCDRBot:
             'phpsessid': self.php_sessionid,
             'last_login': self.last_login_time,
             'cookies': self.cookies,
-            'uptime': str(datetime.now() - self.last_login_time) if self.last_login_time else None
+            'uptime': str(datetime.now() - self.last_login_time) if self.last_login_time else None,
+            'data_checks': self.data_check_count,
+            'last_data_check': self.last_data_check
         }
 
 
@@ -362,7 +495,7 @@ class SMSCDRBot:
 async def main():
     """Main function"""
     logger.info("\n" + "=" * 60)
-    logger.info("🚀 SMS CDR Bot - Starting with Session Management")
+    logger.info("🚀 SMS CDR Bot - Starting with Session Management + Data Monitoring")
     logger.info("=" * 60 + "\n")
     
     try:
@@ -377,8 +510,9 @@ async def main():
             logger.info("✅ Initial login successful!")
             logger.info(f"📊 Session Info: {bot.get_session_info()}\n")
             
-            # Start session keep-alive monitor
+            # Start background tasks
             keep_alive_task = asyncio.create_task(bot.keep_session_alive())
+            monitor_task = asyncio.create_task(bot.monitor_data())
             
             try:
                 # Keep running
@@ -386,8 +520,13 @@ async def main():
             except KeyboardInterrupt:
                 logger.info("\n⏹️ Stopping bot...")
                 keep_alive_task.cancel()
+                monitor_task.cancel()
                 try:
                     await keep_alive_task
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await monitor_task
                 except asyncio.CancelledError:
                     pass
     except Exception as e:
