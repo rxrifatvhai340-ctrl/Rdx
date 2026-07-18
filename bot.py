@@ -1,6 +1,6 @@
 """
 SMS CDR Automation Bot - Single Script with Session Management
-সব কিছু এক ফাইলে + 24/7 Session Keep Alive + Data Monitoring
+সব কিছু এক ফাইলে + 24/7 Session Keep Alive + Data Monitoring + Retry Logic
 """
 
 import asyncio
@@ -30,6 +30,8 @@ LOG_FILE = "bot.log"
 SESSION_CHECK_INTERVAL = 120  # 2 minutes
 DATA_CHECK_INTERVAL = 15.5  # 15.5 seconds
 MAX_RETRIES = 3
+DATA_FETCH_MAX_RETRIES = 5
+DATA_FETCH_RETRY_DELAY = 2  # seconds
 
 # ============ LOGGING SETUP ============
 logging.basicConfig(
@@ -58,6 +60,8 @@ class SMSCDRBot:
         self.last_data_check = None
         self.previous_data = None
         self.data_check_count = 0
+        self.successful_fetches = 0
+        self.failed_fetches = 0
 
     async def __aenter__(self):
         """Context manager entry"""
@@ -314,13 +318,18 @@ class SMSCDRBot:
             logger.error(f"❌ Error checking session: {e}")
             return False
 
-    async def fetch_sms_cdr_data(self) -> Optional[List[Dict]]:
+    async def fetch_sms_cdr_data(self, retry_count=0) -> Optional[List[Dict]]:
         """
-        SMS CDR data fetch করবে
+        SMS CDR data fetch করবে - সাথে retry logic
         """
+        if retry_count >= DATA_FETCH_MAX_RETRIES:
+            logger.error(f"❌ Max retries ({DATA_FETCH_MAX_RETRIES}) exceeded for data fetch")
+            self.failed_fetches += 1
+            return None
+        
         try:
             self.data_check_count += 1
-            logger.info(f"\n📊 Data Check #{self.data_check_count} at {datetime.now()}")
+            logger.info(f"\n📊 Data Check #{self.data_check_count} at {datetime.now()} [Attempt {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}]")
             
             url = f"{self.base_url}/ints/agent/res/data_smscdr.php"
             
@@ -374,14 +383,16 @@ class SMSCDRBot:
                     if 'aaData' in data:
                         records = data['aaData']
                         logger.info(f"✅ Data fetched successfully - Total records: {len(records)}")
+                        self.successful_fetches += 1
                         
                         # Print to terminal
                         print("\n" + "="*100)
                         print(f"📊 SMS CDR DATA - Check #{self.data_check_count} | Time: {datetime.now()}")
+                        print(f"✅ SUCCESS | Total Records: {len(records)}")
                         print("="*100)
                         
                         if len(records) > 0:
-                            print(f"{'Total Records':<15} | {len(records)}")
+                            print(f"{'Showing':<15} | First 5 records (total: {len(records)})")
                             print("-"*100)
                             
                             # Show first 5 records
@@ -404,16 +415,27 @@ class SMSCDRBot:
                         
                         return records
                     else:
-                        logger.warning("⚠️ No 'aaData' in response")
-                        return None
+                        logger.warning("⚠️ No 'aaData' in response, retrying...")
+                        await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
+                        return await self.fetch_sms_cdr_data(retry_count + 1)
+                elif resp.status == 503:
+                    logger.warning(f"⚠️ Server Unavailable (503) - Retry {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}...")
+                    await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
+                    return await self.fetch_sms_cdr_data(retry_count + 1)
                 else:
-                    logger.error(f"❌ Data fetch failed: {resp.status}")
-                    return None
+                    logger.error(f"❌ Data fetch failed: {resp.status} - Retry {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}...")
+                    await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
+                    return await self.fetch_sms_cdr_data(retry_count + 1)
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️ Request timeout - Retry {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}...")
+            await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
+            return await self.fetch_sms_cdr_data(retry_count + 1)
         except Exception as e:
-            logger.error(f"❌ Error fetching SMS CDR data: {e}")
+            logger.error(f"❌ Error fetching SMS CDR data: {e} - Retry {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}...")
             import traceback
             logger.error(traceback.format_exc())
-            return None
+            await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
+            return await self.fetch_sms_cdr_data(retry_count + 1)
 
     async def keep_session_alive(self):
         """
@@ -484,9 +506,10 @@ class SMSCDRBot:
             'sesskey': self.sesskey,
             'phpsessid': self.php_sessionid,
             'last_login': self.last_login_time,
-            'cookies': self.cookies,
             'uptime': str(datetime.now() - self.last_login_time) if self.last_login_time else None,
             'data_checks': self.data_check_count,
+            'successful_fetches': self.successful_fetches,
+            'failed_fetches': self.failed_fetches,
             'last_data_check': self.last_data_check
         }
 
@@ -519,6 +542,7 @@ async def main():
                 await asyncio.sleep(float('inf'))
             except KeyboardInterrupt:
                 logger.info("\n⏹️ Stopping bot...")
+                logger.info(f"📊 Final Stats: {bot.get_session_info()}")
                 keep_alive_task.cancel()
                 monitor_task.cancel()
                 try:
