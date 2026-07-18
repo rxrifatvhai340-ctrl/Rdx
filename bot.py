@@ -1,6 +1,7 @@
 """
 SMS CDR Automation Bot - Single Script with Session Management
 সব কিছু এক ফাইলে + 24/7 Session Keep Alive + Data Monitoring + Retry Logic
+Exact parameters from curl requests
 """
 
 import asyncio
@@ -11,6 +12,7 @@ import time
 import json
 from typing import Optional, Dict, List
 from datetime import datetime
+from urllib.parse import urlencode
 
 # ============ CONFIGURATION ============
 BASE_URL = "http://65.109.111.158"
@@ -120,6 +122,7 @@ class SMSCDRBot:
             headers = {
                 **HEADERS,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Cache-Control': 'max-age=0',
             }
             
             logger.info(f"📄 Fetching login page...")
@@ -234,8 +237,10 @@ class SMSCDRBot:
                 'Origin': self.base_url,
                 'Referer': f"{self.base_url}/ints/login",
                 'Upgrade-Insecure-Requests': '1',
+                'Cache-Control': 'max-age=0',
             }
             
+            # Exact data from curl
             data = {
                 'crlf': '',
                 'username': self.username,
@@ -321,6 +326,7 @@ class SMSCDRBot:
     async def fetch_sms_cdr_data(self, retry_count=0) -> Optional[List[Dict]]:
         """
         SMS CDR data fetch করবে - সাথে retry logic
+        Exact parameters from curl
         """
         if retry_count >= DATA_FETCH_MAX_RETRIES:
             logger.error(f"❌ Max retries ({DATA_FETCH_MAX_RETRIES}) exceeded for data fetch")
@@ -333,7 +339,7 @@ class SMSCDRBot:
             
             url = f"{self.base_url}/ints/agent/res/data_smscdr.php"
             
-            # Build parameters
+            # Exact parameters from curl request
             params = {
                 'fdate1': '2026-07-17 00:00:00',
                 'fdate2': '2026-07-17 23:59:59',
@@ -351,21 +357,60 @@ class SMSCDRBot:
                 'sesskey': self.sesskey or self.php_sessionid,
                 'sEcho': '2',
                 'iColumns': '9',
-                'sColumns': ',,,,,,,,',
+                'sColumns': ',,,,,,,,,',
                 'iDisplayStart': '0',
                 'iDisplayLength': '-1',
+                'mDataProp_0': '0',
+                'sSearch_0': '',
+                'bRegex_0': 'false',
+                'bSearchable_0': 'true',
                 'bSortable_0': 'true',
+                'mDataProp_1': '1',
+                'sSearch_1': '',
+                'bRegex_1': 'false',
+                'bSearchable_1': 'true',
                 'bSortable_1': 'true',
+                'mDataProp_2': '2',
+                'sSearch_2': '',
+                'bRegex_2': 'false',
+                'bSearchable_2': 'true',
                 'bSortable_2': 'true',
+                'mDataProp_3': '3',
+                'sSearch_3': '',
+                'bRegex_3': 'false',
+                'bSearchable_3': 'true',
                 'bSortable_3': 'true',
+                'mDataProp_4': '4',
+                'sSearch_4': '',
+                'bRegex_4': 'false',
+                'bSearchable_4': 'true',
                 'bSortable_4': 'true',
+                'mDataProp_5': '5',
+                'sSearch_5': '',
+                'bRegex_5': 'false',
+                'bSearchable_5': 'true',
                 'bSortable_5': 'true',
+                'mDataProp_6': '6',
+                'sSearch_6': '',
+                'bRegex_6': 'false',
+                'bSearchable_6': 'true',
                 'bSortable_6': 'true',
+                'mDataProp_7': '7',
+                'sSearch_7': '',
+                'bRegex_7': 'false',
+                'bSearchable_7': 'true',
                 'bSortable_7': 'true',
+                'mDataProp_8': '8',
+                'sSearch_8': '',
+                'bRegex_8': 'false',
+                'bSearchable_8': 'true',
                 'bSortable_8': 'false',
+                'sSearch': '',
+                'bRegex': 'false',
                 'iSortCol_0': '0',
                 'sSortDir_0': 'desc',
                 'iSortingCols': '1',
+                '_': str(int(time.time() * 1000)),  # Current timestamp in milliseconds
             }
             
             headers = {
@@ -378,46 +423,56 @@ class SMSCDRBot:
             async with self.session.get(url, params=params, headers=headers, 
                                        cookies=self.cookies, timeout=REQUEST_TIMEOUT, ssl=False) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    content_type = resp.headers.get('Content-Type', '')
                     
-                    if 'aaData' in data:
-                        records = data['aaData']
-                        logger.info(f"✅ Data fetched successfully - Total records: {len(records)}")
-                        self.successful_fetches += 1
+                    # Check if response is JSON
+                    if 'application/json' in content_type or 'text/javascript' in content_type:
+                        data = await resp.json()
                         
-                        # Print to terminal
-                        print("\n" + "="*100)
-                        print(f"📊 SMS CDR DATA - Check #{self.data_check_count} | Time: {datetime.now()}")
-                        print(f"✅ SUCCESS | Total Records: {len(records)}")
-                        print("="*100)
-                        
-                        if len(records) > 0:
-                            print(f"{'Showing':<15} | First 5 records (total: {len(records)})")
-                            print("-"*100)
+                        if 'aaData' in data:
+                            records = data['aaData']
+                            logger.info(f"✅ Data fetched successfully - Total records: {len(records)}")
+                            self.successful_fetches += 1
                             
-                            # Show first 5 records
-                            for idx, record in enumerate(records[:5], 1):
-                                print(f"Record #{idx}: {record}")
+                            # Print to terminal
+                            print("\n" + "="*100)
+                            print(f"📊 SMS CDR DATA - Check #{self.data_check_count} | Time: {datetime.now()}")
+                            print(f"✅ SUCCESS | Total Records: {len(records)}")
+                            print("="*100)
                             
-                            if len(records) > 5:
-                                print(f"... and {len(records) - 5} more records")
+                            if len(records) > 0:
+                                print(f"{'Showing':<15} | First 5 records (total: {len(records)})")
+                                print("-"*100)
+                                
+                                # Show first 5 records
+                                for idx, record in enumerate(records[:5], 1):
+                                    print(f"Record #{idx}: {record}")
+                                
+                                if len(records) > 5:
+                                    print(f"... and {len(records) - 5} more records")
+                            else:
+                                print("ℹ️ No records found")
+                            
+                            print("="*100 + "\n")
+                            
+                            # Check if data changed
+                            if self.previous_data and self.previous_data != records:
+                                logger.info(f"🔔 NEW DATA DETECTED! ({len(records)} records)")
+                            
+                            self.previous_data = records
+                            self.last_data_check = datetime.now()
+                            
+                            return records
                         else:
-                            print("ℹ️ No records found")
-                        
-                        print("="*100 + "\n")
-                        
-                        # Check if data changed
-                        if self.previous_data and self.previous_data != records:
-                            logger.info(f"🔔 NEW DATA DETECTED! ({len(records)} records)")
-                        
-                        self.previous_data = records
-                        self.last_data_check = datetime.now()
-                        
-                        return records
+                            logger.warning("⚠️ No 'aaData' in JSON response, retrying...")
+                            await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
+                            return await self.fetch_sms_cdr_data(retry_count + 1)
                     else:
-                        logger.warning("⚠️ No 'aaData' in response, retrying...")
-                        await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
-                        return await self.fetch_sms_cdr_data(retry_count + 1)
+                        # HTML response received - session likely expired
+                        logger.warning(f"⚠️ Received HTML instead of JSON (Content-Type: {content_type}) - Session may be expired")
+                        self.session_active = False
+                        return None
+                
                 elif resp.status == 503:
                     logger.warning(f"⚠️ Server Unavailable (503) - Retry {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}...")
                     await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
@@ -428,6 +483,10 @@ class SMSCDRBot:
                     return await self.fetch_sms_cdr_data(retry_count + 1)
         except asyncio.TimeoutError:
             logger.warning(f"⚠️ Request timeout - Retry {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}...")
+            await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
+            return await self.fetch_sms_cdr_data(retry_count + 1)
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON decode error: {e} - Retry {retry_count + 1}/{DATA_FETCH_MAX_RETRIES}...")
             await asyncio.sleep(DATA_FETCH_RETRY_DELAY)
             return await self.fetch_sms_cdr_data(retry_count + 1)
         except Exception as e:
